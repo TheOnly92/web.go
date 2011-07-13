@@ -82,11 +82,15 @@ func newRequest(hr *http.Request, hc http.ResponseWriter) *Request {
         Body:       hr.Body,
         Close:      hr.Close,
         Host:       hr.Host,
-        Referer:    hr.Referer,
-        UserAgent:  hr.UserAgent,
+        Referer:    hr.Referer(),
+        UserAgent:  hr.UserAgent(),
         FullParams: hr.Form,
+<<<<<<< HEAD
         Cookie:     hr.Cookie,
 		Cookies:	maps,
+=======
+        Cookie:     hr.Cookies(),
+>>>>>>> 4e0379d1741628ac1b8cb93e7b4c411d2a7b2ee3
         RemoteAddr: remoteAddr.IP.String(),
         RemotePort: remoteAddr.Port,
     }
@@ -187,7 +191,7 @@ func (r *Request) parseParams() (err os.Error) {
     switch r.Method {
     case "POST":
         if r.Body == nil {
-            return os.ErrorString("missing form body")
+            return os.NewError("missing form body")
         }
 
         ct := r.Headers.Get("Content-Type")
