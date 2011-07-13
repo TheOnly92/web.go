@@ -67,7 +67,7 @@ func newRequest(hr *http.Request, hc http.ResponseWriter) *Request {
     remoteAddr, _ := net.ResolveTCPAddr("tcp", hr.RemoteAddr)
 	
 	maps := make(map[string]string)
-	for _, v := range hr.Cookie {
+	for _, v := range hr.Cookies() {
 		maps[v.Name] = v.Value
 	}
 	
