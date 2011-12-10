@@ -1,16 +1,16 @@
 package web
 
 import (
-    "container/vector"
+    "encoding/json"
+    "errors"
     "fmt"
-    "http"
     "io"
     "io/ioutil"
-    "json"
     "mime"
     "mime/multipart"
     "net"
-    "os"
+    "net/http"
+    "net/url"
     "reflect"
     "strconv"
     "strings"
@@ -22,12 +22,12 @@ type filedata struct {
 }
 
 type Request struct {
-    Method     string    // GET, POST, PUT, etc.
-    RawURL     string    // The raw URL given in the request.
-    URL        *http.URL // Parsed URL.
-    Proto      string    // "HTTP/1.0"
-    ProtoMajor int       // 1
-    ProtoMinor int       // 0
+    Method     string   // GET, POST, PUT, etc.
+    RawURL     string   // The raw URL given in the request.
+    URL        *url.URL // Parsed URL.
+    Proto      string   // "HTTP/1.0"
+    ProtoMajor int      // 1
+    ProtoMinor int      // 0
     Headers    http.Header
     Body       io.Reader
     Close      bool
@@ -44,15 +44,14 @@ type Request struct {
     RemotePort int
 }
 
-
 type badStringError struct {
     what string
     str  string
 }
 
-func (e *badStringError) String() string { return fmt.Sprintf("%s %q", e.what, e.str) }
+func (e *badStringError) Error() string { return fmt.Sprintf("%s %q", e.what, e.str) }
 
-func flattenParams(fullParams map[string][]string) map[string]string {
+func FlattenParams(fullParams map[string][]string) map[string]string {
     params := map[string]string{}
     for name, lst := range fullParams {
         if len(lst) > 0 {
@@ -73,7 +72,6 @@ func newRequest(hr *http.Request, hc http.ResponseWriter) *Request {
 	
     req := Request{
         Method:     hr.Method,
-        RawURL:     hr.RawURL,
         URL:        hr.URL,
         Proto:      hr.Proto,
         ProtoMajor: hr.ProtoMajor,
@@ -110,7 +108,7 @@ func newRequestCgi(headers http.Header, body io.Reader) *Request {
     port := headers.Get("SERVER_PORT")
     proto := headers.Get("SERVER_PROTOCOL")
     rawurl := "http://" + host + ":" + port + path
-    url, _ := http.ParseURL(rawurl)
+    url_, _ := url.Parse(rawurl)
     useragent := headers.Get("USER_AGENT")
     remoteAddr := headers.Get("REMOTE_ADDR")
     remotePort, _ := strconv.Atoi(headers.Get("REMOTE_PORT"))
@@ -126,12 +124,12 @@ func newRequestCgi(headers http.Header, body io.Reader) *Request {
     }
 
     //read the cookies
-    cookies := readCookies(httpheader)
+    cookies := ReadCookies(httpheader)
 
     req := Request{
         Method:     method,
         RawURL:     rawurl,
-        URL:        url,
+        URL:        url_,
         Proto:      proto,
         Host:       host,
         UserAgent:  useragent,
@@ -145,31 +143,25 @@ func newRequestCgi(headers http.Header, body io.Reader) *Request {
     return &req
 }
 
-func parseForm(m map[string][]string, query string) (err os.Error) {
-    data := make(map[string]*vector.StringVector)
-    for _, kv := range strings.Split(query, "&", -1) {
-        kvPair := strings.Split(kv, "=", 2)
+func ParseForm(m map[string][]string, query string) (err error) {
+    for _, kv := range strings.Split(query, "&") {
+        kvPair := strings.SplitN(kv, "=", 2)
 
         var key, value string
-        var e os.Error
-        key, e = http.URLUnescape(kvPair[0])
+        var e error
+        key, e = url.QueryUnescape(kvPair[0])
         if e == nil && len(kvPair) > 1 {
-            value, e = http.URLUnescape(kvPair[1])
+            value, e = url.QueryUnescape(kvPair[1])
         }
         if e != nil {
             err = e
         }
 
-        vec, ok := data[key]
+        vec, ok := m[key]
         if !ok {
-            vec = new(vector.StringVector)
-            data[key] = vec
+            vec = []string{}
         }
-        vec.Push(value)
-    }
-
-    for k, vec := range data {
-        m[k] = vec.Copy()
+        m[key] = append(vec, value)
     }
 
     return
@@ -177,7 +169,7 @@ func parseForm(m map[string][]string, query string) (err os.Error) {
 
 // ParseForm parses the request body as a form for POST requests, or the raw query for GET requests.
 // It is idempotent.
-func (r *Request) parseParams() (err os.Error) {
+func (r *Request) ParseParams() (err error) {
     if r.Params != nil {
         return
     }
@@ -187,11 +179,11 @@ func (r *Request) parseParams() (err os.Error) {
     switch r.Method {
     case "POST":
         if r.Body == nil {
-            return os.NewError("missing form body")
+            return errors.New("missing form body")
         }
 
         ct := r.Headers.Get("Content-Type")
-        switch strings.Split(ct, ";", 2)[0] {
+        switch strings.SplitN(ct, ";", 2)[0] {
         case "text/plain", "application/x-www-form-urlencoded", "":
             var b []byte
             if b, err = ioutil.ReadAll(r.Body); err != nil {
@@ -209,22 +201,27 @@ func (r *Request) parseParams() (err os.Error) {
             r.Params = map[string]string{}
             json.Unmarshal(b, r.Params)
         case "multipart/form-data":
-            _, params := mime.ParseMediaType(ct)
+            _, params, err := mime.ParseMediaType(ct)
+            if err != nil {
+                return err
+            }
             boundary, ok := params["boundary"]
             if !ok {
-                return os.NewError("Missing Boundary")
+                return errors.New("Missing Boundary")
             }
+
             reader := multipart.NewReader(r.Body, boundary)
             r.Files = make(map[string]filedata)
             for {
                 part, err := reader.NextPart()
+                if part == nil && err == io.EOF {
+                    break
+                }
+
                 if err != nil {
                     return err
                 }
 
-                if part == nil {
-                    break
-                }
                 //read the data
                 data, _ := ioutil.ReadAll(part)
                 //check for the 'filename' param
@@ -233,15 +230,18 @@ func (r *Request) parseParams() (err os.Error) {
                     continue
                 }
                 name := part.FormName()
-                d, params := mime.ParseMediaType(v)
+                d, params, err := mime.ParseMediaType(v)
+                if err != nil {
+                    return err
+                }
                 if d != "form-data" {
                     continue
                 }
                 if params["filename"] != "" {
                     r.Files[name] = filedata{params["filename"], data}
                 } else {
-                    var params vector.StringVector = r.FullParams[name]
-                    params.Push(string(data))
+                    var params []string = r.FullParams[name]
+                    params = append(params, string(data))
                     r.FullParams[name] = params
                 }
 
@@ -250,21 +250,22 @@ func (r *Request) parseParams() (err os.Error) {
             return &badStringError{"unknown Content-Type", ct}
         }
     }
+
     if queryParams != "" {
-        err = parseForm(r.FullParams, queryParams)
+        err = ParseForm(r.FullParams, queryParams)
         if err != nil {
             return err
         }
     }
 
     if bodyParams != "" {
-        err = parseForm(r.FullParams, bodyParams)
+        err = ParseForm(r.FullParams, bodyParams)
         if err != nil {
             return err
         }
     }
 
-    r.Params = flattenParams(r.FullParams)
+    r.Params = FlattenParams(r.FullParams)
     return nil
 }
 
@@ -276,7 +277,7 @@ func (r *Request) HasFile(name string) bool {
     return ok
 }
 
-func writeTo(s string, val reflect.Value) os.Error {
+func writeTo(s string, val reflect.Value) error {
     switch v := val; v.Kind() {
     // if we're writing to an interace value, just set the byte data
     // TODO: should we support writing to a pointer?
@@ -323,7 +324,7 @@ func matchName(key, name string) bool {
     return strings.ToLower(key) == strings.ToLower(name)
 }
 
-func (r *Request) writeToContainer(val reflect.Value) os.Error {
+func (r *Request) writeToContainer(val reflect.Value) error {
     switch v := val; v.Kind() {
     case reflect.Ptr:
         return r.writeToContainer(reflect.Indirect(v))
@@ -331,7 +332,7 @@ func (r *Request) writeToContainer(val reflect.Value) os.Error {
         return r.writeToContainer(v.Elem())
     case reflect.Map:
         if v.Type().Key().Kind() != reflect.String {
-            return os.NewError("Invalid map type")
+            return errors.New("Invalid map type")
         }
         elemtype := v.Type().Elem()
         for pk, pv := range r.Params {
@@ -356,13 +357,12 @@ func (r *Request) writeToContainer(val reflect.Value) os.Error {
 
         }
     default:
-        return os.NewError("Invalid container type")
+        return errors.New("Invalid container type")
     }
     return nil
 }
 
-
-func (r *Request) UnmarshalParams(val interface{}) os.Error {
+func (r *Request) UnmarshalParams(val interface{}) error {
     if strings.HasPrefix(r.Headers.Get("Content-Type"), "application/json") {
         return json.Unmarshal(r.ParamData, val)
     } else {

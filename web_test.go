@@ -3,11 +3,13 @@ package web
 import (
     "bytes"
     "encoding/binary"
+    "encoding/json"
     "fmt"
-    "http"
-    "json"
+    "io"
     "log"
     "os"
+    "net/http"
+    "net/url"
     "runtime"
     "strconv"
     "strings"
@@ -23,15 +25,15 @@ type tcpBuffer struct {
     output *bytes.Buffer
 }
 
-func (buf *tcpBuffer) Write(p []uint8) (n int, err os.Error) {
+func (buf *tcpBuffer) Write(p []uint8) (n int, err error) {
     return buf.output.Write(p)
 }
 
-func (buf *tcpBuffer) Read(p []byte) (n int, err os.Error) {
+func (buf *tcpBuffer) Read(p []byte) (n int, err error) {
     return buf.input.Read(p)
 }
 
-func (buf *tcpBuffer) Close() os.Error { return nil }
+func (buf *tcpBuffer) Close() error { return nil }
 
 type testResponse struct {
     statusCode int
@@ -46,7 +48,7 @@ func buildTestResponse(buf *bytes.Buffer) *testResponse {
     response := testResponse{headers: make(map[string][]string), cookies: make(map[string]string)}
     s := buf.String()
 
-    contents := strings.Split(s, "\r\n\r\n", 2)
+    contents := strings.SplitN(s, "\r\n\r\n", 2)
 
     header := contents[0]
 
@@ -54,13 +56,13 @@ func buildTestResponse(buf *bytes.Buffer) *testResponse {
         response.body = contents[1]
     }
 
-    headers := strings.Split(header, "\r\n", -1)
+    headers := strings.Split(header, "\r\n")
 
-    statusParts := strings.Split(headers[0], " ", 3)
+    statusParts := strings.SplitN(headers[0], " ", 3)
     response.statusCode, _ = strconv.Atoi(statusParts[1])
 
     for _, h := range headers[1:] {
-        split := strings.Split(h, ":", 2)
+        split := strings.SplitN(h, ":", 2)
         name := strings.TrimSpace(split[0])
         value := strings.TrimSpace(split[1])
         if _, ok := response.headers[name]; !ok {
@@ -76,7 +78,7 @@ func buildTestResponse(buf *bytes.Buffer) *testResponse {
         if name == "Set-Cookie" {
             i := strings.Index(value, ";")
             cookie := value[0:i]
-            cookieParts := strings.Split(cookie, "=", 2)
+            cookieParts := strings.SplitN(cookie, "=", 2)
             response.cookies[strings.TrimSpace(cookieParts[0])] = strings.TrimSpace(cookieParts[1])
         }
     }
@@ -90,7 +92,7 @@ func getTestResponse(method string, path string, body string, headers map[string
 
     tcpb := tcpBuffer{nil, &buf}
     c := scgiConn{wroteHeaders: false, headers: make(map[string][]string), fd: &tcpb}
-    mainServer.routeHandler(req, &c)
+    mainServer.RouteHandler(req, &c)
     return buildTestResponse(&buf)
 
 }
@@ -106,7 +108,6 @@ type Test struct {
 type StructHandler struct {
     a string
 }
-
 
 func (s *StructHandler) method() string {
     return s.a
@@ -210,7 +211,7 @@ func buildTestRequest(method string, path string, body string, headers map[strin
     host := "127.0.0.1"
     port := "80"
     rawurl := "http://" + host + ":" + port + path
-    url, _ := http.ParseURL(rawurl)
+    url_, _ := url.Parse(rawurl)
 
     proto := "HTTP/1.1"
     useragent := "web.go test framework"
@@ -227,7 +228,7 @@ func buildTestRequest(method string, path string, body string, headers map[strin
     req := Request{Method: method,
         RawURL:    rawurl,
         Cookie:    cookies,
-        URL:       url,
+        URL:       url_,
         Proto:     proto,
         Host:      host,
         UserAgent: useragent,
@@ -415,7 +416,6 @@ func TestScgiHead(t *testing.T) {
     }
 }
 
-
 func buildFcgiKeyValue(key string, val string) []byte {
 
     var buf bytes.Buffer
@@ -500,7 +500,7 @@ func getFcgiOutput(br *bytes.Buffer) *bytes.Buffer {
     for {
         var h fcgiHeader
         err := binary.Read(br, binary.BigEndian, &h)
-        if err == os.EOF {
+        if err == io.EOF {
             break
         }
 
@@ -633,7 +633,6 @@ func TestSecureCookie(t *testing.T) {
         t.Fatalf("SecureCookie test failed")
     }
 }
-
 
 func TestSecureCookieFcgi(t *testing.T) {
     mainServer.Config.CookieSecret = "7C19QRmwf3mHZ9CPAaPQ0hsWeufKd"

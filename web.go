@@ -2,16 +2,16 @@ package web
 
 import (
     "bytes"
-    "container/vector"
     "crypto/hmac"
     "encoding/base64"
     "fmt"
-    "http"
-    "http/pprof"
     "io/ioutil"
     "log"
     "mime"
     "net"
+    "net/http"
+    "net/http/pprof"
+    "net/url"
     "os"
     "path"
     "reflect"
@@ -19,13 +19,14 @@ import (
     "runtime"
     "strconv"
     "strings"
+    "syscall"
     "time"
 )
 
 type conn interface {
     StartResponse(status int)
     SetHeader(hdr string, val string, unique bool)
-    Write(data []byte) (n int, err os.Error)
+    Write(data []byte) (n int, err error)
     Close()
 }
 
@@ -41,7 +42,7 @@ func (ctx *Context) StartResponse(status int) {
     ctx.responseStarted = true
 }
 
-func (ctx *Context) Write(data []byte) (n int, err os.Error) {
+func (ctx *Context) Write(data []byte) (n int, err error) {
     if !ctx.responseStarted {
         ctx.StartResponse(200)
     }
@@ -62,10 +63,10 @@ func (ctx *Context) Abort(status int, body string) {
     ctx.WriteString(body)
 }
 
-func (ctx *Context) Redirect(status int, url string) {
-    ctx.SetHeader("Location", url, true)
+func (ctx *Context) Redirect(status int, url_ string) {
+    ctx.SetHeader("Location", url_, true)
     ctx.StartResponse(status)
-    ctx.WriteString("Redirecting to: " + url)
+    ctx.WriteString("Redirecting to: " + url_)
 }
 
 func (ctx *Context) NotModified() {
@@ -91,14 +92,16 @@ func (ctx *Context) ContentType(ext string) {
 
 //Sets a cookie -- duration is the amount of time in seconds. 0 = forever
 func (ctx *Context) SetCookie(name string, value string, age int64) {
-    var utctime *time.Time
+    var utctime time.Time
+    var tdelta time.Duration 
     if age == 0 {
-        // 2^31 - 1 seconds (roughly 2038)
-        utctime = time.SecondsToUTC(2147483647)
+        // 2^31 - 1 seconds (roughly 27 years from now)
+        tdelta = time.Second * 2147483647
     } else {
-        utctime = time.SecondsToUTC(time.UTC().Seconds() + age)
+        tdelta = time.Second * time.Duration(age)
     }
-    cookie := fmt.Sprintf("%s=%s; expires=%s; path=/", name, value, webTime(utctime))
+    utctime = time.Now().Add(tdelta).UTC()
+    cookie := fmt.Sprintf("%s=%s; expires=%s", name, value, webTime(&utctime))
     ctx.SetHeader("Set-Cookie", cookie, false)
 }
 
@@ -106,9 +109,8 @@ func getCookieSig(key string, val []byte, timestamp string) string {
     hm := hmac.NewSHA1([]byte(key))
 
     hm.Write(val)
-    hm.Write([]byte(timestamp))
 
-    hex := fmt.Sprintf("%02x", hm.Sum())
+    hex := fmt.Sprintf("%02x", hm.Sum([]byte(timestamp)))
     return hex
 }
 
@@ -124,7 +126,7 @@ func (ctx *Context) SetSecureCookie(name string, val string, age int64) {
     encoder.Close()
     vs := buf.String()
     vb := buf.Bytes()
-    timestamp := strconv.Itoa64(time.Seconds())
+    timestamp := strconv.Itoa64(time.Now().Unix())
     sig := getCookieSig(ctx.Server.Config.CookieSecret, vb, timestamp)
     cookie := strings.Join([]string{vs, timestamp, sig}, "|")
     ctx.SetCookie(name, cookie, age)
@@ -136,7 +138,7 @@ func (ctx *Context) GetSecureCookie(name string) (string, bool) {
             continue
         }
 
-        parts := strings.Split(cookie.Value, "|", 3)
+        parts := strings.SplitN(cookie.Value, "|", 3)
 
         val := parts[0]
         timestamp := parts[1]
@@ -148,7 +150,7 @@ func (ctx *Context) GetSecureCookie(name string) (string, bool) {
 
         ts, _ := strconv.Atoi64(timestamp)
 
-        if time.Seconds()-31*86400 > ts {
+        if time.Now().Unix() - 31*86400 > ts {
             return "", false
         }
 
@@ -200,10 +202,10 @@ func (s *Server) addRoute(r string, method string, handler interface{}) {
     }
 
     if fv, ok := handler.(reflect.Value); ok {
-        s.routes.Push(route{r, cr, method, fv})
+        s.routes = append(s.routes, route{r, cr, method, fv})
     } else {
         fv := reflect.ValueOf(handler)
-        s.routes.Push(route{r, cr, method, fv})
+        s.routes = append(s.routes, route{r, cr, method, fv})
     }
 }
 
@@ -224,7 +226,7 @@ func (c *httpConn) WriteString(content string) {
     c.conn.Write(buf.Bytes())
 }
 
-func (c *httpConn) Write(content []byte) (n int, err os.Error) {
+func (c *httpConn) Write(content []byte) (n int, err error) {
     return c.conn.Write(content)
 }
 
@@ -242,7 +244,7 @@ func (c *httpConn) Close() {
 func (s *Server) ServeHTTP(c http.ResponseWriter, req *http.Request) {
     conn := httpConn{c}
     wreq := newRequest(req, c)
-    s.routeHandler(wreq, &conn)
+    s.RouteHandler(wreq, &conn)
 }
 
 //Calls a function with recover block
@@ -289,7 +291,7 @@ func requiresContext(handlerType reflect.Type) bool {
     return false
 }
 
-func (s *Server) routeHandler(req *Request, c conn) {
+func (s *Server) RouteHandler(req *Request, c conn) {
     requestPath := req.URL.Path
 
     //log the request
@@ -300,9 +302,9 @@ func (s *Server) routeHandler(req *Request, c conn) {
     }
 
     //parse the form data (if it exists)
-    perr := req.parseParams()
+    perr := req.ParseParams()
     if perr != nil {
-        s.Logger.Printf("Failed to parse form data %q\n", perr.String())
+        s.Logger.Printf("Failed to parse form data %q\n", perr.Error())
     }
 
     ctx := Context{req, s, c, false}
@@ -311,22 +313,25 @@ func (s *Server) routeHandler(req *Request, c conn) {
     ctx.SetHeader("Content-Type", "text/html; charset=utf-8", true)
     ctx.SetHeader("Server", "web.go", true)
 
-    tm := time.UTC()
-    ctx.SetHeader("Date", webTime(tm), true)
+    tm := time.Now().UTC()
+    ctx.SetHeader("Date", webTime(&tm), true)
 
     //try to serve a static file
     staticDir := s.Config.StaticDir
-    if staticDir == "" {
-        staticDir = defaultStaticDir()
+    if staticDir != "NONE" {
+        if staticDir == "" {
+            staticDir = defaultStaticDir()
+        }
+        staticFile := path.Join(staticDir, requestPath)
+        if fileExists(staticFile) && (req.Method == "GET" || req.Method == "HEAD") {
+            serveFile(&ctx, staticFile)
+            return
+        }
     }
-    staticFile := path.Join(staticDir, requestPath)
-    if fileExists(staticFile) && (req.Method == "GET" || req.Method == "HEAD") {
-        serveFile(&ctx, staticFile)
-        return
-    }
+    
 
-    for i := 0; i < s.routes.Len(); i++ {
-        route := s.routes.At(i).(route)
+    for i := 0; i < len(s.routes); i++ {
+        route := s.routes[i]
         cr := route.cr
         //if the methods don't match, skip this handler (except HEAD can be used in place of GET)
         if req.Method != route.method && !(req.Method == "HEAD" && route.method == "GET") {
@@ -342,21 +347,16 @@ func (s *Server) routeHandler(req *Request, c conn) {
             continue
         }
 
-        var args vector.Vector
+        var args []reflect.Value
         handlerType := route.handler.Type()
         if requiresContext(handlerType) {
-            args.Push(reflect.ValueOf(&ctx))
+            args = append(args, reflect.ValueOf(&ctx))
         }
         for _, arg := range match[1:] {
-            args.Push(reflect.ValueOf(arg))
+            args = append(args, reflect.ValueOf(arg))
         }
 
-        valArgs := make([]reflect.Value, args.Len())
-        for i := 0; i < args.Len(); i++ {
-            valArgs[i] = args.At(i).(reflect.Value)
-        }
-
-        ret, err := s.safelyCall(route.handler, valArgs)
+        ret, err := s.safelyCall(route.handler, args)
         if err != nil {
             //fmt.Printf("%v\n", err)
             //there was an error or panic while calling the handler
@@ -394,6 +394,11 @@ func (s *Server) routeHandler(req *Request, c conn) {
     ctx.Abort(404, "Page not found")
 }
 
+type Listener interface {
+    Listen(s *Server)
+}
+
+
 var Config = &ServerConfig{
     RecoverPanic: true,
 }
@@ -405,7 +410,7 @@ var mainServer = Server{
 
 type Server struct {
     Config *ServerConfig
-    routes vector.Vector
+    routes []route
     Logger *log.Logger
     //save the listener so it can be closed
     l      net.Listener
@@ -423,8 +428,7 @@ func (s *Server) initServer() {
 }
 
 //Runs the web application and serves http requests
-func (s *Server) Run(addr string) {
-    s.initServer()
+func NativeRunner(s *Server, addr string) {
 
     mux := http.NewServeMux()
 
@@ -445,9 +449,10 @@ func (s *Server) Run(addr string) {
     s.l.Close()
 }
 
+
 //Runs the web application and serves http requests
 func Run(addr string) {
-    mainServer.Run(addr)
+    Runner(addr, NativeRunner)
 }
 
 //Stops the web server
@@ -461,27 +466,30 @@ func Close() {
     mainServer.Close()
 }
 
-func (s *Server) RunScgi(addr string) {
-    s.initServer()
+func Runner(addr string, runner func(s *Server, addr string)()){
+    mainServer.initServer()
+    runner(&mainServer, addr)
+}
+
+func ScgiRunner(s *Server, addr string) {
     s.Logger.Printf("web.go serving scgi %s\n", addr)
     s.listenAndServeScgi(addr)
 }
 
 //Runs the web application and serves scgi requests
 func RunScgi(addr string) {
-    mainServer.RunScgi(addr)
+    Runner(addr, ScgiRunner)
 }
 
 //Runs the web application and serves scgi requests for this Server object.
-func (s *Server) RunFcgi(addr string) {
-    s.initServer()
+func FcgiRunner(s *Server, addr string) {
     s.Logger.Printf("web.go serving fcgi %s\n", addr)
     s.listenAndServeFcgi(addr)
 }
 
 //Runs the web application by serving fastcgi requests
 func RunFcgi(addr string) {
-    mainServer.RunFcgi(addr)
+    Runner(addr,FcgiRunner)
 }
 
 //Adds a handler for the 'GET' http method.
@@ -553,18 +561,23 @@ func dirExists(dir string) bool {
     switch {
     case e != nil:
         return false
-    case !d.IsDirectory():
+    case !d.IsDir():
         return false
     }
 
     return true
 }
 
+
+func isRegular(f os.FileInfo) bool { 
+    return (f.Mode() & syscall.S_IFMT) == syscall.S_IFREG 
+}
+
 func fileExists(dir string) bool {
     info, err := os.Stat(dir)
     if err != nil {
         return false
-    } else if !info.IsRegular() {
+    } else if !isRegular(info) {
         return false
     }
 
@@ -574,9 +587,9 @@ func fileExists(dir string) bool {
 func Urlencode(data map[string]string) string {
     var buf bytes.Buffer
     for k, v := range data {
-        buf.WriteString(http.URLEscape(k))
+        buf.WriteString(url.QueryEscape(k))
         buf.WriteByte('=')
-        buf.WriteString(http.URLEscape(v))
+        buf.WriteString(url.QueryEscape(v))
         buf.WriteByte('&')
     }
     s := buf.String()
