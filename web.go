@@ -19,7 +19,6 @@ import (
     "runtime"
     "strconv"
     "strings"
-    "syscall"
     "time"
 )
 
@@ -570,7 +569,7 @@ func dirExists(dir string) bool {
 
 
 func isRegular(f os.FileInfo) bool { 
-    return (f.Mode() & syscall.S_IFMT) == syscall.S_IFREG 
+    return (f.Mode() & os.ModeType) == 0
 }
 
 func fileExists(dir string) bool {
